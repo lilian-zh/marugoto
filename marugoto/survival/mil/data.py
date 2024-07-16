@@ -1,14 +1,16 @@
 import sys
 sys.path.append('..')
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Iterable, Optional, Sequence, Tuple
 from pathlib import Path
 import h5py
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 import pandas as pd
+import numpy as np
 
 from data import EncodedDataset, MapDataset, SKLearnEncoder, SurvDataset
+from fastai.data.load import DataLoader as FastaiTfmdDL
 
 
 __all__ = ['BagDataset', 'make_dataset', 'get_cohort_df']
@@ -191,3 +193,95 @@ def get_cohort_df(
                           right_index=True).reset_index()
 
     return df
+
+
+class EPBSampler(Sampler):
+    def __init__(self, data_source, batch_size, drop_last=True):
+        self.data_source = data_source
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        assert batch_size <= len(data_source), "Batch size cannot be larger than the size of the dataset"
+
+        self.total_indices = list(range(len(data_source)))
+        np.random.shuffle(self.total_indices)
+        #print('total_indices:', self.total_indices)
+        self.event_indices = [i for i, data in enumerate(data_source) if data[2][1] > 0.1]  # hard-coding, need improvement
+        np.random.shuffle(self.event_indices)
+        #print('event_indices:', self.event_indices)
+        self.event_iter = iter(self.event_indices)
+
+    def __iter__(self):
+            #total_indices = list(range(len(self.data_source)))
+            #np.random.shuffle(total_indices)
+            #event_iter = iter(np.random.permutation(self.event_indices))
+            batch = []
+            for idx in self.total_indices:
+                batch.append(idx)
+                if len(batch) == self.batch_size:
+                    #print('original batch:', batch)
+                    if self.event_indices:
+                        try:
+                            replace_inx = next(self.event_iter)
+                            #print('replace_inx:', replace_inx)
+                            if replace_inx not in batch:
+                                batch[np.random.randint(len(batch))] = replace_inx
+                        except StopIteration:
+                            self.event_iter = iter(np.random.permutation(self.event_indices))
+                            #batch[np.random.randint(len(batch))] = next(self.event_iter)
+                            replace_idx = next(self.event_iter)
+                            if replace_idx not in batch:
+                                batch[np.random.randint(len(batch))] = replace_idx
+                    #print(f"Yielding batch: {batch}")  
+                    yield batch
+                    #print(f"Yielding batch of size: {len(batch)}")  
+                    #print(f"Yielding batch: {batch}")
+                    batch = []
+            if batch and len(batch) > 1 and not self.drop_last:
+                if self.event_indices:
+                    try:
+                        batch[np.random.randint(len(batch))] = next(self.event_iter)
+                    except StopIteration:
+                        self.event_iter = iter(np.random.permutation(self.event_indices))
+                        batch[np.random.randint(len(batch))] = next(self.event_iter)
+                yield batch
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.total_indices) // self.batch_size
+        else:
+            return (len(self.total_indices) + self.batch_size - 1) // self.batch_size
+
+
+def epb_collate_fn(batch):
+    #print(f"Received batch: {batch}")
+    batch_feats, batch_lens, batch_targets = zip(*batch)
+    batch_feats = torch.stack(batch_feats)
+    batch_lens = torch.tensor(batch_lens)
+    batch_targets = torch.stack(batch_targets)
+    #print(f"Collated batch_feats: {batch_feats.shape}, batch_lens: {batch_lens.shape}, batch_targets: {batch_targets.shape}")
+    return batch_feats, batch_lens, batch_targets
+
+
+
+class EPBDataLoader(FastaiTfmdDL):
+    def __init__(self, dataset, batch_sampler, collate_func, **kwargs):
+        self.batch_sampler = batch_sampler
+        self.collate_func = collate_func
+        self.sampler_iter = iter(batch_sampler)
+        super().__init__(dataset, **kwargs)
+
+    def __iter__(self):
+        for batch in self.batch_sampler:
+            yield self.collate_func([self.dataset[i] for i in batch])
+
+    def get_idxs(self):
+        return next(self.sampler_iter)
+
+
+    def create_batches(self, samps):
+        return super().create_batches(samps)
+
+    def do_batch(self, b):
+        """rewrite do_batch to use custom_collate_fn ."""
+        batch = self.collate_func(b)
+        return self.retain(batch, b)  # retain to ensure data type

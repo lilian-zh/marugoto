@@ -11,7 +11,7 @@ from mil.model import MILModel
 from Early_Stopping import EarlyStopping
 from loss import cox_loss, concordance_index
 from sklearn.model_selection import train_test_split
-from mil.data import get_cohort_df, make_dataset
+from mil.data import get_cohort_df, make_dataset, EPBSampler, epb_collate_fn, EPBDataLoader
 
 parser = argparse.ArgumentParser(description='Train')
 parser.add_argument('-ct', '--clinical_table', type=Path, required=True, help='clinical_table')
@@ -26,6 +26,7 @@ parser.add_argument('-lr', '--lr', default=1e-5, type=float, help='lr')
 parser.add_argument('-bgs', '--bag_size', default=512, type=int, help='bag_size')
 parser.add_argument('-l1', '--l1_reg', default=1e-3, type=float, help='l1_reg')
 parser.add_argument('-l2', '--l2_reg', default=1e-3, type=float, help='l2_reg')
+parser.add_argument('-epb', '--event_per_batch', default=False, type=bool, help='at least one event per batch in train loader')
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,6 +55,7 @@ def get_table(clini_excel, slide_csv, feature_dir, target_label, output_path):
 
     test_patients = None
     df = get_cohort_df(clini_excel, slide_csv, feature_dir, target_label, categories=None)
+    event_label = target_label[1]
 
     if os.path.exists(output_path / 'train.csv') and os.path.exists(output_path / 'test.csv'):
         train_patients = pd.read_csv(output_path / 'train.csv').PATIENT
@@ -63,7 +65,7 @@ def get_table(clini_excel, slide_csv, feature_dir, target_label, output_path):
         train_patients = pd.read_csv(output_path / 'train.csv').PATIENT
         valid_patients = pd.read_csv(output_path / 'valid.csv').PATIENT
     else:
-        train_patients, valid_patients = train_test_split(df.PATIENT, test_size=0.3)
+        train_patients, valid_patients = train_test_split(df.PATIENT, stratify=df[event_label], test_size=0.2, random_state=5)
 
         train_df = df[df.PATIENT.isin(train_patients)]
         valid_df = df[df.PATIENT.isin(valid_patients)]
@@ -121,7 +123,11 @@ def train(epochs, model, train_dl, device, criterion, train_dl_v, valid_dl, logg
 
         model.train()
 
-        for x_batch_train, x_batch_len, y_batch_train in train_dl:
+        for batch_data in train_dl:
+            x_batch_train, x_batch_len, y_batch_train = batch_data
+            x_batch_train = x_batch_train.to(device) if isinstance(x_batch_train, torch.Tensor) else torch.tensor(x_batch_train).to(device)
+            x_batch_len = x_batch_len.to(device) if isinstance(x_batch_len, torch.Tensor) else torch.tensor(x_batch_len).to(device)
+            y_batch_train = y_batch_train.to(device) if isinstance(y_batch_train, torch.Tensor) else torch.tensor(y_batch_train).to(device)
 
             optimizer.zero_grad()
 
@@ -181,6 +187,7 @@ if __name__ == '__main__':
     bag_size = args.bag_size
     l1 = args.l1_reg
     l2 = args.l2_reg
+    event_per_batch = args.event_per_batch
 
     model_save_path = output_path / f'lr_{lr}_l1_{l1}_l2_{l2}_best_model.pth'
 
@@ -208,6 +215,7 @@ if __name__ == '__main__':
     logger.info(f'DACHS:{DACHS}')
     logger.info(f'l1 lambda:{l1}')
     logger.info(f'l2 lambda:{l2}')
+    logger.info(f'event_per_batch:{event_per_batch}')
 
     add_features = []
 
@@ -237,9 +245,13 @@ if __name__ == '__main__':
 
     # build dataloaders
     drop_last = True  # train_ds._len % batch_size <= batch_size//2#
-    train_dl = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, drop_last=drop_last,
-        num_workers=num_workers)
+    if event_per_batch:
+        custom_sampler = EPBSampler(data_source=train_ds, batch_size=batch_size, drop_last=drop_last)
+        train_dl = EPBDataLoader(dataset=train_ds, batch_sampler=custom_sampler, bs=batch_size, num_workers=num_workers, collate_func=epb_collate_fn)
+    else:
+        train_dl = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, drop_last=drop_last,
+            num_workers=num_workers)
 
     train_dl_v = DataLoader(
         train_ds_v, batch_size=1, shuffle=False,
